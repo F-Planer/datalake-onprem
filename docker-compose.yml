@@ -1,0 +1,600 @@
+# DataLake on-premises — POC
+#
+# Base (no profile, always starts): Postgres + SeaweedFS (S3) + Polaris (Iceberg catalog).
+# Profiles:
+#   streaming         Kafka + Karapace + Kafka UI + Spark + streaming job into bronze
+#   cdc               Kafka + Karapace + Kafka UI + Spark + Debezium (Kafka Connect) + ERP CDC job
+#   simulated-source  SQL Server Developer simulating an ERP (with CDC) and the DW
+#   generator         order producer and ERP simulator (use with `docker compose run`)
+#   batch             Airflow + Spark (scheduled loads, gold and delivery to the SQL Server DW)
+#   query             Trino (SQL over bronze, silver and gold)
+#   notebook          JupyterLab connected to Spark and the lakehouse
+#
+#   docker compose up -d                          # base only
+#   docker compose --profile streaming up -d      # base + streaming
+#   docker compose --profile simulated-source --profile cdc up -d   # base + simulated SQL Server + CDC
+#
+# Secrets live in .env (template in .env.example).
+# Ports are bound to 127.0.0.1; to expose them on the network, change to 0.0.0.0.
+
+name: datalake
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+# Settings shared by the Airflow services (batch profile)
+x-airflow: &airflow
+  image: datalake/airflow:3.3.2
+  profiles: [batch]
+  logging: *logging
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD}@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set in .env}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?set in .env}
+    AIRFLOW__API_AUTH__JWT_ISSUER: datalake
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__PARALLELISM: 4
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: America/Sao_Paulo
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # Credentials passed to the Spark jobs (via /opt/spark/submit-job.sh and the environment)
+    POLARIS_ROOT_CLIENT_ID: ${POLARIS_ROOT_CLIENT_ID}
+    POLARIS_ROOT_CLIENT_SECRET: ${POLARIS_ROOT_CLIENT_SECRET}
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+    S3_SECRET_KEY: ${S3_SECRET_KEY}
+    SQLSERVER_HOST: ${SQLSERVER_HOST}
+    SQLSERVER_PORT: ${SQLSERVER_PORT}
+    SQLSERVER_DB: ${SQLSERVER_DB}
+    SQLSERVER_BATCH_USER: ${SQLSERVER_BATCH_USER}
+    SQLSERVER_BATCH_PASSWORD: ${SQLSERVER_BATCH_PASSWORD}
+    SQLSERVER_DW_DB: ${SQLSERVER_DW_DB:?set in .env}
+    SQLSERVER_DW_USER: ${SQLSERVER_DW_USER:?set in .env}
+    SQLSERVER_DW_PASSWORD: ${SQLSERVER_DW_PASSWORD:?set in .env}
+    # The Spark driver runs in the scheduler container (LocalExecutor)
+    SPARK_SUBMIT_EXTRA: --conf spark.driver.host=airflow-scheduler
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags:ro
+    - ./jobs:/opt/airflow/jobs:ro
+    - airflow-logs:/opt/airflow/logs
+
+services:
+
+  # ---------------------------------------------------------------- base ----
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *logging
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POLARIS_DB_PASSWORD: ${POLARIS_DB_PASSWORD:?set in .env}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?set in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./config/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d polaris"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.54
+    restart: unless-stopped
+    mem_limit: 1g
+    logging: *logging
+    entrypoint: ["/bin/sh", "/config/start.sh"]
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set in .env}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set in .env}
+    volumes:
+      - seaweedfs-data:/data
+      - ./config/seaweedfs:/config:ro
+    ports:
+      - "127.0.0.1:8333:8333"   # API S3
+      - "127.0.0.1:9333:9333"   # master UI
+      - "127.0.0.1:8888:8888"   # filer UI (browse files)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9333/cluster/healthz && wget -q -O /dev/null http://127.0.0.1:8333/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  seaweedfs-bucket:
+    image: chrislusf/seaweedfs:4.54
+    restart: "no"
+    entrypoint: ["/bin/sh", "/config/create-bucket.sh"]
+    environment:
+      BUCKET: lakehouse
+    volumes:
+      - ./config/seaweedfs:/config:ro
+    depends_on:
+      seaweedfs: { condition: service_healthy }
+
+  polaris-bootstrap:
+    image: apache/polaris-admin-tool:1.9.0
+    restart: "no"
+    entrypoint: ["/bin/sh", "/config/bootstrap.sh"]
+    environment: &polaris-db
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/polaris
+      QUARKUS_DATASOURCE_USERNAME: polaris
+      QUARKUS_DATASOURCE_PASSWORD: ${POLARIS_DB_PASSWORD}
+      POLARIS_ROOT_CLIENT_ID: ${POLARIS_ROOT_CLIENT_ID:?set in .env}
+      POLARIS_ROOT_CLIENT_SECRET: ${POLARIS_ROOT_CLIENT_SECRET:?set in .env}
+    volumes:
+      - ./config/polaris:/config:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  polaris:
+    image: apache/polaris:1.9.0
+    restart: unless-stopped
+    mem_limit: 1g
+    logging: *logging
+    environment:
+      <<: *polaris-db
+      POLARIS_REALM_CONTEXT_REALMS: POLARIS
+      JAVA_OPTS_APPEND: -XX:MaxRAMPercentage=70
+      # Credential Polaris itself uses to write metadata to SeaweedFS
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
+      AWS_REGION: us-east-1
+    ports:
+      - "127.0.0.1:8181:8181"   # Iceberg REST + management API
+      - "127.0.0.1:8182:8182"   # health and metrics
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8182/q/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+    depends_on:
+      polaris-bootstrap: { condition: service_completed_successfully }
+      seaweedfs-bucket: { condition: service_completed_successfully }
+
+  polaris-catalog:
+    image: apache/polaris:1.9.0
+    restart: "no"
+    entrypoint: ["/bin/sh", "/config/create-catalog.sh"]
+    environment:
+      POLARIS_ROOT_CLIENT_ID: ${POLARIS_ROOT_CLIENT_ID}
+      POLARIS_ROOT_CLIENT_SECRET: ${POLARIS_ROOT_CLIENT_SECRET}
+    volumes:
+      - ./config/polaris:/config:ro
+    depends_on:
+      polaris: { condition: service_healthy }
+
+  # ----------------------------------------------------------- streaming ----
+
+  kafka:
+    image: apache/kafka:4.4.0
+    profiles: [streaming, cdc]
+    restart: unless-stopped
+    mem_limit: 2g
+    logging: *logging
+    environment:
+      # KRaft mode: a single node acts as broker and controller (no ZooKeeper).
+      CLUSTER_ID: n8i74h2vTK2XhfTP7NuTpg
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # INTERNAL: stack containers (kafka:9092). EXTERNAL: programs on the host (localhost:29092).
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # Single broker: replication factor 1 everywhere.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 72
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms1g -Xmx1g
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      - "127.0.0.1:29092:29092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 15s
+      start_period: 20s
+      retries: 20
+
+  karapace:
+    image: ghcr.io/aiven-open/karapace:6.2.4
+    profiles: [streaming, cdc]
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *logging
+    command: ["python3", "-m", "karapace"]
+    environment:
+      KARAPACE_KARAPACE_REGISTRY: "true"
+      KARAPACE_BOOTSTRAP_URI: kafka:9092
+      KARAPACE_HOST: 0.0.0.0
+      KARAPACE_PORT: 8081
+      KARAPACE_ADVERTISED_HOSTNAME: karapace
+      KARAPACE_ADVERTISED_PORT: 8081
+      KARAPACE_TOPIC_NAME: _schemas
+      KARAPACE_REPLICATION_FACTOR: 1
+      KARAPACE_COMPATIBILITY: BACKWARD
+      KARAPACE_LOG_LEVEL: WARNING
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD", "python3", "/opt/karapace/healthcheck.py", "http://127.0.0.1:8081/_health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      kafka: { condition: service_healthy }
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    profiles: [streaming, cdc]
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *logging
+    environment:
+      KAFKA_CLUSTERS_0_NAME: datalake
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://karapace:8081
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://kafka-connect:8083
+      DYNAMIC_CONFIG_ENABLED: "false"
+      JAVA_OPTS: -XX:MaxRAMPercentage=70
+    ports:
+      - "127.0.0.1:8085:8080"
+    depends_on:
+      karapace: { condition: service_healthy }
+
+  # Fake order generator. Does not start on its own; with the streaming profile up, use:
+  #   docker compose run --rm order-producer --total 1000
+  #   docker compose run --rm order-producer --per-second 5
+  order-producer:
+    build: ./producers/orders
+    image: datalake/order-producer:local
+    profiles: [generator]
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      SCHEMA_REGISTRY_URL: http://karapace:8081
+    # No depends_on: the streaming profile must already be up.
+
+  # ----------------------------------------------- spark (streaming and batch) --
+
+  spark-master:
+    build: ./spark
+    image: datalake/spark:4.1.4
+    profiles: [streaming, cdc, batch, notebook]
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *logging
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master"]
+    environment:
+      SPARK_DAEMON_MEMORY: 256m
+    ports:
+      - "127.0.0.1:8090:8080"   # master UI
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/json/ > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  spark-worker:
+    image: datalake/spark:4.1.4
+    profiles: [streaming, cdc, batch, notebook]
+    restart: unless-stopped
+    mem_limit: 6g
+    logging: *logging
+    # 8 cores / 5 GiB for executors: each application uses 2 cores (spark.cores.max),
+    # so up to 4 fit at the same time (streaming, CDC and batch jobs).
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077",
+              "--host", "spark-worker", "--cores", "8", "--memory", "5g"]
+    environment:
+      SPARK_DAEMON_MEMORY: 256m
+    volumes:
+      - spark-checkpoints:/checkpoints
+    ports:
+      - "127.0.0.1:8091:8081"   # worker UI
+    depends_on:
+      spark-master: { condition: service_healthy }
+
+  spark-streaming-bronze:
+    image: datalake/spark:4.1.4
+    profiles: [streaming]
+    restart: unless-stopped
+    mem_limit: 1536m
+    logging: *logging
+    command: ["/opt/spark/submit-job.sh", "/opt/spark/jobs/streaming/bronze_orders.py"]
+    environment:
+      POLARIS_ROOT_CLIENT_ID: ${POLARIS_ROOT_CLIENT_ID}
+      POLARIS_ROOT_CLIENT_SECRET: ${POLARIS_ROOT_CLIENT_SECRET}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      SPARK_SUBMIT_EXTRA: --conf spark.driver.host=spark-streaming-bronze
+    volumes:
+      - ./jobs:/opt/spark/jobs:ro
+      - spark-checkpoints:/checkpoints
+    ports:
+      - "127.0.0.1:4040:4040"   # job UI (Structured Streaming tab)
+    depends_on:
+      spark-worker: { condition: service_started }
+      karapace: { condition: service_healthy }
+      polaris-catalog: { condition: service_completed_successfully }
+
+  # ---------------------------------------- simulated source (SQL Server) --
+  # Simulates the source SQL Server. With a real database this profile is not
+  # used: just point SQLSERVER_HOST/DB/users in .env to it.
+  # Developer edition: free, for development and testing only (has CDC).
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2025-CU11-ubuntu-24.04
+    profiles: [simulated-source]
+    restart: unless-stopped
+    mem_limit: 3g
+    logging: *logging
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?set in .env}
+      MSSQL_AGENT_ENABLED: "true"      # CDC depends on SQL Server Agent
+      MSSQL_MEMORY_LIMIT_MB: 2048
+      TZ: UTC
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    ports:
+      - "127.0.0.1:1433:1433"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 30
+
+  sqlserver-init:
+    image: mcr.microsoft.com/mssql/server:2025-CU11-ubuntu-24.04
+    profiles: [simulated-source]
+    restart: "no"
+    entrypoint: ["/bin/bash", "/config/init.sh"]
+    environment: &sqlserver-env
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+      SQLSERVER_DB: ${SQLSERVER_DB:?set in .env}
+      SQLSERVER_CDC_USER: ${SQLSERVER_CDC_USER:?set in .env}
+      SQLSERVER_CDC_PASSWORD: ${SQLSERVER_CDC_PASSWORD:?set in .env}
+      SQLSERVER_BATCH_USER: ${SQLSERVER_BATCH_USER:?set in .env}
+      SQLSERVER_BATCH_PASSWORD: ${SQLSERVER_BATCH_PASSWORD:?set in .env}
+      SQLSERVER_DW_DB: ${SQLSERVER_DW_DB:?set in .env}
+      SQLSERVER_DW_USER: ${SQLSERVER_DW_USER:?set in .env}
+      SQLSERVER_DW_PASSWORD: ${SQLSERVER_DW_PASSWORD:?set in .env}
+    volumes:
+      - ./config/sqlserver:/config:ro
+    depends_on:
+      sqlserver: { condition: service_healthy }
+
+  # ERP activity simulator. Does not start on its own; with the simulated-source profile up:
+  #   docker compose run --rm erp-simulator                      # 3 orders every 5 s
+  #   docker compose run --rm -e INTERVAL=1 erp-simulator        # faster
+  erp-simulator:
+    image: mcr.microsoft.com/mssql/server:2025-CU11-ubuntu-24.04
+    profiles: [generator]
+    entrypoint: ["/bin/bash", "/config/simulate.sh"]
+    environment: *sqlserver-env
+    volumes:
+      - ./config/sqlserver:/config:ro
+
+  # Bulk load of past data (months of orders). Runs once and exits:
+  #   docker compose run --rm erp-history                          # 100k orders, 180 days
+  #   docker compose run --rm -e ORDERS=500000 -e DAYS=365 erp-history
+  erp-history:
+    image: mcr.microsoft.com/mssql/server:2025-CU11-ubuntu-24.04
+    profiles: [generator]
+    entrypoint: ["/bin/bash", "/config/history.sh"]
+    environment: *sqlserver-env
+    volumes:
+      - ./config/sqlserver:/config:ro
+
+  # ------------------------------------------------------------------ cdc ----
+
+  kafka-connect:
+    build: ./kafka-connect
+    image: datalake/kafka-connect:3.7.1
+    profiles: [cdc]
+    restart: unless-stopped
+    mem_limit: 1536m
+    logging: *logging
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: connect-datalake
+      CONFIG_STORAGE_TOPIC: _connect-configs
+      OFFSET_STORAGE_TOPIC: _connect-offsets
+      STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # Connectors read secrets as ${env:VAR}: the password is never stored in Kafka.
+      CONNECT_CONFIG_PROVIDERS: env
+      CONNECT_CONFIG_PROVIDERS_ENV_CLASS: org.apache.kafka.common.config.provider.EnvVarConfigProvider
+      CONNECT_CONFIG_PROVIDERS_ENV_PARAM_ALLOWLIST_PATTERN: ^SQLSERVER_.*
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx1g
+      SQLSERVER_HOST: ${SQLSERVER_HOST:?set in .env}
+      SQLSERVER_PORT: ${SQLSERVER_PORT:?set in .env}
+      SQLSERVER_DB: ${SQLSERVER_DB:?set in .env}
+      SQLSERVER_CDC_USER: ${SQLSERVER_CDC_USER:?set in .env}
+      SQLSERVER_CDC_PASSWORD: ${SQLSERVER_CDC_PASSWORD:?set in .env}
+    ports:
+      - "127.0.0.1:8083:8083"   # Kafka Connect REST API
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8083/ > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 30
+    depends_on:
+      kafka: { condition: service_healthy }
+      karapace: { condition: service_healthy }
+
+  debezium-register:
+    image: datalake/kafka-connect:3.7.1
+    profiles: [cdc]
+    restart: "no"
+    entrypoint: ["/bin/sh", "/config/register.sh"]
+    volumes:
+      - ./config/debezium:/config:ro
+    depends_on:
+      kafka-connect: { condition: service_healthy }
+
+  spark-cdc:
+    image: datalake/spark:4.1.4
+    profiles: [cdc]
+    restart: unless-stopped
+    mem_limit: 1536m
+    logging: *logging
+    command: ["/opt/spark/submit-job.sh", "/opt/spark/jobs/cdc/erp_cdc.py"]
+    environment:
+      POLARIS_ROOT_CLIENT_ID: ${POLARIS_ROOT_CLIENT_ID}
+      POLARIS_ROOT_CLIENT_SECRET: ${POLARIS_ROOT_CLIENT_SECRET}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      TOPIC_PREFIX: erp.${SQLSERVER_DB}.dbo
+      TABLES: Orders,OrderItems,Stock,Payments,Shipments
+      SPARK_SUBMIT_EXTRA: --conf spark.driver.host=spark-cdc
+    volumes:
+      - ./jobs:/opt/spark/jobs:ro
+      - spark-checkpoints:/checkpoints
+    ports:
+      - "127.0.0.1:4041:4040"   # job UI (Structured Streaming tab)
+    depends_on:
+      spark-worker: { condition: service_started }
+      karapace: { condition: service_healthy }
+      polaris-catalog: { condition: service_completed_successfully }
+
+  # ---------------------------------------------------------------- query --
+
+  trino:
+    image: trinodb/trino:484
+    profiles: [query]
+    restart: unless-stopped
+    mem_limit: 3g
+    logging: *logging
+    environment:
+      POLARIS_ROOT_CLIENT_ID: ${POLARIS_ROOT_CLIENT_ID}
+      POLARIS_ROOT_CLIENT_SECRET: ${POLARIS_ROOT_CLIENT_SECRET}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+    volumes:
+      - ./config/trino/config.properties:/etc/trino/config.properties:ro
+      - ./config/trino/catalog/lakehouse.properties:/etc/trino/catalog/lakehouse.properties:ro
+    ports:
+      - "127.0.0.1:8088:8080"   # web UI and SQL connections (DBeaver, CLI)
+    healthcheck:
+      test: ["CMD", "/usr/lib/trino/bin/health-check"]   # the image's own checker
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 30
+    depends_on:
+      polaris-catalog: { condition: service_completed_successfully }
+
+  # ---------------------------------------------------------------- batch --
+
+  airflow-init:
+    <<: *airflow
+    build: ./airflow
+    restart: "no"
+    command: ["bash", "-c", "airflow pools set spark 2 'Concurrent Spark jobs'"]
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?set in .env}
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  airflow-apiserver:
+    <<: *airflow
+    restart: unless-stopped
+    mem_limit: 1536m
+    command: api-server
+    ports:
+      - "127.0.0.1:8095:8080"   # Airflow web UI
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/api/v2/version > /dev/null"]
+      interval: 15s
+      timeout: 10s
+      start_period: 40s
+      retries: 20
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-scheduler:
+    <<: *airflow
+    hostname: airflow-scheduler
+    restart: unless-stopped
+    mem_limit: 3g   # includes the tasks' Spark drivers (up to 2 at a time)
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8974/health > /dev/null"]
+      interval: 15s
+      timeout: 10s
+      start_period: 40s
+      retries: 20
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+      spark-master: { condition: service_healthy }
+
+  airflow-dag-processor:
+    <<: *airflow
+    restart: unless-stopped
+    mem_limit: 768m
+    command: dag-processor
+    depends_on:
+      airflow-init: { condition: service_completed_successfully }
+
+  # ------------------------------------------------------------- notebook --
+
+  jupyter:
+    build: ./notebook
+    image: datalake/jupyter:4.6
+    profiles: [notebook]
+    hostname: jupyter
+    restart: unless-stopped
+    mem_limit: 2g
+    logging: *logging
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:?set in .env}
+      # Every SparkSession created in the notebook is already connected to the
+      # cluster and the lakehouse catalog (the rest comes from the image's spark-defaults.conf).
+      PYSPARK_SUBMIT_ARGS: >-
+        --conf spark.sql.catalog.lakehouse.credential=${POLARIS_ROOT_CLIENT_ID}:${POLARIS_ROOT_CLIENT_SECRET}
+        --conf spark.sql.catalog.lakehouse.s3.access-key-id=${S3_ACCESS_KEY}
+        --conf spark.sql.catalog.lakehouse.s3.secret-access-key=${S3_SECRET_KEY}
+        --conf spark.driver.host=jupyter
+        pyspark-shell
+    volumes:
+      - ./notebooks:/home/analyst/notebooks
+    ports:
+      - "127.0.0.1:8899:8888"   # JupyterLab
+    depends_on:
+      spark-master: { condition: service_healthy }
+
+volumes:
+  airflow-logs:
+  sqlserver-data:
+  postgres-data:
+  seaweedfs-data:
+  kafka-data:
+  spark-checkpoints:

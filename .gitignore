@@ -1,0 +1,10 @@
+# Secrets: use .env.example as the template
+.env
+
+# Local data and artifacts
+*.log
+__pycache__/
+.venv/
+
+# Local, private notes (internal context, open items): never published
+*.local.md

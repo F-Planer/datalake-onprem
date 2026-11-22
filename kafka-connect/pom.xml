@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Only used so Maven downloads the Confluent Avro converter (Apache 2.0)
+     and its dependencies while building the Kafka Connect image. -->
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>datalake.poc</groupId>
+  <artifactId>avro-converter</artifactId>
+  <version>1</version>
+  <packaging>pom</packaging>
+
+  <repositories>
+    <repository>
+      <id>confluent</id>
+      <url>https://packages.confluent.io/maven/</url>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.confluent</groupId>
+      <artifactId>kafka-connect-avro-converter</artifactId>
+      <version>8.4.1</version>
+    </dependency>
+  </dependencies>
+</project>
